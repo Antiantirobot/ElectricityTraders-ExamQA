@@ -1,0 +1,42 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>电力交易题库刷题</title>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" id="sidebar">
+      <div class="brand">
+        <h1>电力交易题库刷题</h1>
+        <p>电力交易知识学习平台</p>
+      </div>
+      <nav class="nav" id="mainNav">
+        <button data-route="#/dashboard">首页</button>
+        <button data-route="#/chapters">章节刷题</button>
+        <button data-route="#/exam">模拟考试</button>
+        <button data-route="#/wrongs">错题本</button>
+        <button data-route="#/favorites">收藏夹</button>
+        <button data-route="#/stats">学习统计</button>
+        <button data-route="#/manage">题库管理</button>
+      </nav>
+    </aside>
+
+    <main class="content">
+      <header class="topbar">
+        <button class="menu-toggle" id="menuToggle" aria-label="菜单">☰</button>
+        <div>
+          <h2 id="pageTitle">首页</h2>
+          <p id="pageSubtitle">开始你的电力交易知识练习</p>
+        </div>
+      </header>
+      <section id="view"></section>
+    </main>
+  </div>
+
+  <script src="./question_bank.js"></script>
+  <script src="./app.js"></script>
+</body>
+</html>
