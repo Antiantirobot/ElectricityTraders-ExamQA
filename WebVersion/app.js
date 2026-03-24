@@ -8,8 +8,10 @@ const STORAGE_KEYS = {
   favoriteQuestions: 'etqb_favorite_questions',
   fullBankApplied: 'etqb_full_bank_applied',
   fullBankSize: 'etqb_full_bank_size',
-  cloudConfig: 'etqb_cloud_config',
-  cloudLastSyncAt: 'etqb_cloud_last_sync_at'
+  examBankScope: 'etqb_exam_bank_scope',
+  localSelectedUser: 'etqb_local_selected_user',
+  localUsersMap: 'etqb_local_users_map',
+  localLastSyncAt: 'etqb_local_last_sync_at'
 };
 
 const DEFAULT_CHAPTERS = [
@@ -42,8 +44,10 @@ const appState = {
   exam: null,
   importPreview: [],
   selectedChapterIndex: 0,
-  cloudStatus: '未启用云同步',
-  cloudConfig: null
+  examBankScope: 'all',
+  localUserId: 'default',
+  localUserStatus: '本地用户未初始化',
+  localUsers: []
 };
 
 const db = {
@@ -71,9 +75,8 @@ function getChapters() {
   });
 }
 
-let cloudSyncTimer = null;
-let cloudSyncInFlight = false;
-let cloudApplyingRemote = false;
+let localUserSyncTimer = null;
+let localUserSyncInFlight = false;
 
 function uid(prefix) { return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`; }
 
@@ -88,37 +91,25 @@ function readStore(key, fallback) {
 
 function writeStore(key, value) { localStorage.setItem(key, JSON.stringify(value)); }
 
-function getCloudConfig() {
-  const cfg = readStore(STORAGE_KEYS.cloudConfig, null);
-  return {
-    enabled: !!cfg?.enabled,
-    autoSync: cfg?.autoSync !== false,
-    serverUrl: String(cfg?.serverUrl || '').trim(),
-    userId: String(cfg?.userId || '').trim(),
-    password: String(cfg?.password || '')
-  };
+function normalizeLocalUserId(raw) {
+  return String(raw || '').trim().slice(0, 64);
 }
 
-function setCloudConfig(cfg) {
-  appState.cloudConfig = {
-    enabled: !!cfg?.enabled,
-    autoSync: cfg?.autoSync !== false,
-    serverUrl: String(cfg?.serverUrl || '').trim(),
-    userId: String(cfg?.userId || '').trim(),
-    password: String(cfg?.password || '')
-  };
-  writeStore(STORAGE_KEYS.cloudConfig, appState.cloudConfig);
+function getLocalSelectedUser() {
+  const stored = normalizeLocalUserId(readStore(STORAGE_KEYS.localSelectedUser, 'default'));
+  return stored || 'default';
 }
 
-function setCloudStatus(text) {
-  appState.cloudStatus = text;
-  const el = document.getElementById('cloudStatus');
+function setLocalSelectedUser(userId) {
+  const normalized = normalizeLocalUserId(userId) || 'default';
+  appState.localUserId = normalized;
+  writeStore(STORAGE_KEYS.localSelectedUser, normalized);
+}
+
+function setLocalUserStatus(text) {
+  appState.localUserStatus = text;
+  const el = document.getElementById('localUserStatus');
   if (el) el.textContent = text;
-}
-
-function getCloudBaseUrl() {
-  const raw = appState.cloudConfig?.serverUrl?.trim() || '';
-  return raw.replace(/\/+$/, '');
 }
 
 function buildProgressStatePayload() {
@@ -139,84 +130,111 @@ function applyProgressState(payload) {
   db.favoriteQuestions = Array.isArray(payload?.favoriteQuestions) ? payload.favoriteQuestions : [];
 }
 
-async function callCloudApi(path, body) {
-  const base = getCloudBaseUrl();
-  const url = `${base}${path}`;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body)
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok || data?.ok === false) {
-    throw new Error(data?.message || `请求失败: ${res.status}`);
-  }
-  return data;
+function getLocalUsersMap() {
+  const m = readStore(STORAGE_KEYS.localUsersMap, {});
+  if (!m || typeof m !== 'object' || Array.isArray(m)) return {};
+  return m;
 }
 
-function isCloudConfigured() {
-  const cfg = appState.cloudConfig;
-  return !!(cfg?.enabled && cfg?.userId && cfg?.password);
+function writeLocalUsersMap(m) {
+  writeStore(STORAGE_KEYS.localUsersMap, m || {});
 }
 
-async function pullCloudState(showNotice = false) {
-  if (!isCloudConfigured()) return false;
+function setProgressStateEmpty() {
+  db.practiceRecords = [];
+  db.examRecords = [];
+  db.examQuestions = [];
+  db.wrongQuestions = [];
+  db.favoriteQuestions = [];
+  appState.practice = null;
+  appState.exam = null;
+  appState.importPreview = [];
+  writeStore(STORAGE_KEYS.localLastSyncAt, null);
+}
+
+async function refreshLocalUsers() {
+  const map = getLocalUsersMap();
+  const users = Object.entries(map).map(([userId, item]) => ({
+    userId,
+    updatedAt: String(item?.updatedAt || '')
+  }));
+  users.sort((a, b) => (a.updatedAt || '').localeCompare(b.updatedAt || '') * -1);
+  appState.localUsers = users;
+  return true;
+}
+
+async function saveLocalUserState(showNotice = false) {
+  if (!appState.localUserId || localUserSyncInFlight) return false;
   try {
-    setCloudStatus('正在拉取云端进度...');
-    const data = await callCloudApi('/api/sync/pull', {
-      userId: appState.cloudConfig.userId,
-      password: appState.cloudConfig.password
-    });
-    if (data?.hasData && data?.state) {
-      cloudApplyingRemote = true;
-      applyProgressState(data.state);
-      writeStore(STORAGE_KEYS.cloudLastSyncAt, data.updatedAt || new Date().toISOString());
-      saveAll();
-      cloudApplyingRemote = false;
-      if (showNotice) alert('已从云端同步最新进度。');
-      setCloudStatus(`云端已同步（${formatTime(readStore(STORAGE_KEYS.cloudLastSyncAt, null))}）`);
-      return true;
-    }
-    setCloudStatus('云端暂无历史进度');
-    if (showNotice) alert('云端暂无历史进度。');
-    return false;
-  } catch (err) {
-    cloudApplyingRemote = false;
-    setCloudStatus(`云同步失败：${err.message}`);
-    if (showNotice) alert(`拉取失败：${err.message}`);
-    return false;
-  }
-}
-
-async function pushCloudState(showNotice = false) {
-  if (!isCloudConfigured() || cloudSyncInFlight || cloudApplyingRemote) return false;
-  try {
-    cloudSyncInFlight = true;
-    setCloudStatus('正在上传云端进度...');
-    const now = new Date().toISOString();
-    const data = await callCloudApi('/api/sync/push', {
-      userId: appState.cloudConfig.userId,
-      password: appState.cloudConfig.password,
-      state: buildProgressStatePayload(),
-      clientUpdatedAt: now
-    });
-    writeStore(STORAGE_KEYS.cloudLastSyncAt, data.updatedAt || now);
-    setCloudStatus(`云端已同步（${formatTime(readStore(STORAGE_KEYS.cloudLastSyncAt, null))}）`);
-    if (showNotice) alert('进度已上传到云端。');
+    localUserSyncInFlight = true;
+    const updatedAt = new Date().toISOString();
+    const map = getLocalUsersMap();
+    map[appState.localUserId] = {
+      updatedAt,
+      state: buildProgressStatePayload()
+    };
+    writeLocalUsersMap(map);
+    writeStore(STORAGE_KEYS.localLastSyncAt, updatedAt);
+    setLocalUserStatus(`当前用户：${appState.localUserId}（已保存 ${formatTime(updatedAt)}）`);
+    if (showNotice) alert(`用户 ${appState.localUserId} 的进度已保存。`);
+    await refreshLocalUsers();
     return true;
   } catch (err) {
-    setCloudStatus(`云同步失败：${err.message}`);
-    if (showNotice) alert(`上传失败：${err.message}`);
+    setLocalUserStatus(`本地保存失败：${err.message}`);
+    if (showNotice) alert(`保存失败：${err.message}`);
     return false;
   } finally {
-    cloudSyncInFlight = false;
+    localUserSyncInFlight = false;
   }
 }
 
-function scheduleCloudAutoPush() {
-  if (!isCloudConfigured() || !appState.cloudConfig.autoSync || cloudApplyingRemote) return;
-  clearTimeout(cloudSyncTimer);
-  cloudSyncTimer = setTimeout(() => { pushCloudState(false); }, 1200);
+function scheduleLocalUserAutoSave() {
+  if (!appState.localUserId) return;
+  clearTimeout(localUserSyncTimer);
+  localUserSyncTimer = setTimeout(() => { saveLocalUserState(false); }, 800);
+}
+
+async function loadLocalUserState(userId, showNotice = false) {
+  const target = normalizeLocalUserId(userId);
+  if (!target) return false;
+  try {
+    setLocalSelectedUser(target);
+    const map = getLocalUsersMap();
+    const item = map[target];
+    if (item?.state) {
+      applyProgressState(item.state);
+      appState.practice = null;
+      appState.exam = null;
+      appState.importPreview = [];
+      writeStore(STORAGE_KEYS.localLastSyncAt, item.updatedAt || new Date().toISOString());
+      saveAll();
+      setLocalUserStatus(`当前用户：${target}（已加载 ${formatTime(readStore(STORAGE_KEYS.localLastSyncAt, null))}）`);
+      if (showNotice) alert(`已切换到用户 ${target}。`);
+    } else {
+      setProgressStateEmpty();
+      saveAll();
+      await saveLocalUserState(false);
+      setLocalUserStatus(`当前用户：${target}（新用户，已创建空进度）`);
+      if (showNotice) alert(`用户 ${target} 不存在，已新建并初始化。`);
+    }
+    await refreshLocalUsers();
+    return true;
+  } catch (err) {
+    setLocalUserStatus(`读取用户失败：${err?.message || err}`);
+    if (showNotice) alert(`切换用户失败：${err.message}`);
+    return false;
+  }
+}
+
+async function switchLocalUser(userId, showNotice = false) {
+  const target = normalizeLocalUserId(userId);
+  if (!target) {
+    if (showNotice) alert('请输入用户名称。');
+    return false;
+  }
+  if (target === appState.localUserId) return true;
+  await saveLocalUserState(false);
+  return loadLocalUserState(target, showNotice);
 }
 
 function saveAll() {
@@ -226,19 +244,11 @@ function saveAll() {
   writeStore(STORAGE_KEYS.examQuestions, db.examQuestions);
   writeStore(STORAGE_KEYS.wrongQuestions, db.wrongQuestions);
   writeStore(STORAGE_KEYS.favoriteQuestions, db.favoriteQuestions);
-  scheduleCloudAutoPush();
+  scheduleLocalUserAutoSave();
 }
 
 function clearLearningRecords() {
-  db.practiceRecords = [];
-  db.examRecords = [];
-  db.examQuestions = [];
-  db.wrongQuestions = [];
-  db.favoriteQuestions = [];
-  appState.practice = null;
-  appState.exam = null;
-  appState.importPreview = [];
-  writeStore(STORAGE_KEYS.cloudLastSyncAt, null);
+  setProgressStateEmpty();
   saveAll();
 }
 
@@ -292,7 +302,8 @@ function getDefaultQuestionBank() {
 }
 
 function loadData() {
-  if (!appState.cloudConfig) appState.cloudConfig = getCloudConfig();
+  appState.localUserId = getLocalSelectedUser();
+  appState.examBankScope = readStore(STORAGE_KEYS.examBankScope, 'all') || 'all';
   db.questions = readStore(STORAGE_KEYS.questions, []);
   db.practiceRecords = readStore(STORAGE_KEYS.practiceRecords, []);
   db.examRecords = readStore(STORAGE_KEYS.examRecords, []);
@@ -317,6 +328,23 @@ function loadData() {
       saveAll();
     }
   }
+
+  const usersMap = getLocalUsersMap();
+  const hasUsers = Object.keys(usersMap).length > 0;
+  const hasLegacyProgress = db.practiceRecords.length || db.examRecords.length || db.examQuestions.length || db.wrongQuestions.length || db.favoriteQuestions.length;
+  if (!hasUsers && hasLegacyProgress) {
+    usersMap[appState.localUserId] = {
+      updatedAt: new Date().toISOString(),
+      state: buildProgressStatePayload()
+    };
+    writeLocalUsersMap(usersMap);
+  }
+}
+
+function updateExamBankScopeFromUI() {
+  const val = document.getElementById('examBankScope')?.value || 'all';
+  appState.examBankScope = ['original', 'supplement', 'all'].includes(val) ? val : 'all';
+  writeStore(STORAGE_KEYS.examBankScope, appState.examBankScope);
 }
 
 function escapeHtml(str) {
@@ -365,8 +393,11 @@ function activeNav(hash) {
 function renderDashboard() {
   const s = getStats();
   const chapters = getChapters();
-  const cfg = appState.cloudConfig || getCloudConfig();
-  const lastSync = readStore(STORAGE_KEYS.cloudLastSyncAt, null);
+  const localLastSync = readStore(STORAGE_KEYS.localLastSyncAt, null);
+  const localUsers = Array.isArray(appState.localUsers) ? appState.localUsers : [];
+  const userOptions = localUsers.length
+    ? localUsers.map((u) => `<option value="${escapeHtml(u.userId)}" ${u.userId === appState.localUserId ? 'selected' : ''}>${escapeHtml(u.userId)}</option>`).join('')
+    : `<option value="${escapeHtml(appState.localUserId)}">${escapeHtml(appState.localUserId)}</option>`;
   return `
   <div class="grid cards-5">
     <article class="card"><div class="label">总题量</div><div class="metric">${s.total}</div></article>
@@ -387,22 +418,19 @@ function renderDashboard() {
     </div>
   </div>
   <div class="card" style="margin-top:12px;">
-    <h3>云同步（跨设备）</h3>
-    <p class="hint" style="margin-top:6px;">同一账号可在电脑和手机同步练习进度。服务器地址留空表示同域部署。</p>
+    <h3>本地用户进度</h3>
+    <p class="hint" style="margin-top:6px;">无需服务器。数据保存在当前浏览器本地存储，不同用户使用独立进度。</p>
     <div class="filter" style="margin-top:8px;">
-      <input id="cloudServerUrl" type="text" placeholder="服务器地址，如 https://your-domain.com" value="${escapeHtml(cfg.serverUrl || '')}" />
-      <input id="cloudUserId" type="text" placeholder="学习账号（如 zhangsan）" value="${escapeHtml(cfg.userId || '')}" />
-      <input id="cloudPassword" type="text" placeholder="同步密码" value="${escapeHtml(cfg.password || '')}" />
-      <label class="hint"><input id="cloudEnabled" type="checkbox" ${cfg.enabled ? 'checked' : ''} /> 启用云同步</label>
-      <label class="hint"><input id="cloudAutoSync" type="checkbox" ${cfg.autoSync ? 'checked' : ''} /> 自动同步</label>
+      <select id="localUserSelect">${userOptions}</select>
+      <input id="localUserInput" type="text" placeholder="输入新用户名（如 lisi）" />
     </div>
     <div class="row" style="margin-top:8px;">
-      <button class="btn" data-act="save-cloud-config">保存配置</button>
-      <button class="btn" data-act="cloud-pull">从云端拉取</button>
-      <button class="btn primary" data-act="cloud-push">上传到云端</button>
+      <button class="btn" data-act="switch-local-user">切换用户</button>
+      <button class="btn primary" data-act="save-local-user">保存当前进度</button>
+      <button class="btn" data-act="refresh-local-users">刷新用户列表</button>
     </div>
-    <p class="hint" id="cloudStatus" style="margin-top:8px;">${escapeHtml(appState.cloudStatus || '未启用云同步')}</p>
-    <p class="hint">最近同步：${formatTime(lastSync)}</p>
+    <p class="hint" id="localUserStatus" style="margin-top:8px;">${escapeHtml(appState.localUserStatus || `当前用户：${appState.localUserId}`)}</p>
+    <p class="hint">最近本地保存：${formatTime(localLastSync)}</p>
   </div>
   <div class="grid cards-3" style="margin-top:12px;">
     ${chapters.slice(0,3).map((c,i)=>{const st=chapterStats(c);return `<article class="card"><h3>${c}</h3><p class="hint" style="margin-top:8px;">题量 ${st.count} | 正确率 ${st.accuracy}%</p><button class="btn" style="margin-top:10px;" data-route="#/chapter/${i}">进入章节</button></article>`;}).join('')}
@@ -618,10 +646,35 @@ function drawRandomWithRepeat(pool, count) {
   return shuffle(result).slice(0, count);
 }
 
-function startExam() {
-  const singlePool = db.questions.filter((q) => q.isActive && q.questionType === 'single');
-  const multiplePool = db.questions.filter((q) => q.isActive && q.questionType === 'multiple');
-  const judgePool = db.questions.filter((q) => q.isActive && q.questionType === 'judge');
+function examScopeLabel(scope) {
+  if (scope === 'original') return '原始题库';
+  if (scope === 'supplement') return '补充题库';
+  return '全部考题';
+}
+
+function isSupplementQuestion(q) {
+  const chapter = String(q?.chapter || '').trim();
+  const source = String(q?.source || '').trim();
+  const sourceLower = source.toLowerCase();
+
+  if (chapter.includes('第十一章') || chapter.includes('补充题库')) return true;
+  if (source.includes('补充题库') || source.includes('更新-电力交易员题库')) return true;
+  if (sourceLower.includes('.pdf') && !sourceLower.includes('.doc') && !sourceLower.includes('.docx')) return true;
+  return false;
+}
+
+function filterQuestionsByExamScope(scope) {
+  const list = db.questions.filter((q) => q.isActive);
+  if (scope === 'original') return list.filter((q) => !isSupplementQuestion(q));
+  if (scope === 'supplement') return list.filter((q) => isSupplementQuestion(q));
+  return list;
+}
+
+function startExam(scope = appState.examBankScope || 'all') {
+  const scoped = filterQuestionsByExamScope(scope);
+  const singlePool = scoped.filter((q) => q.questionType === 'single');
+  const multiplePool = scoped.filter((q) => q.questionType === 'multiple');
+  const judgePool = scoped.filter((q) => q.questionType === 'judge');
   if (!singlePool.length || !multiplePool.length || !judgePool.length) { alert('单选/多选/判断题至少各需要 1 道题。'); return; }
 
   const list = [
@@ -630,7 +683,7 @@ function startExam() {
     ...drawRandomWithRepeat(judgePool, 40).map((q) => ({ questionId: q.id, questionType: 'judge', score: 0.5 }))
   ];
 
-  appState.exam = { id: uid('exam'), examName: `模拟考试 ${new Date().toLocaleString()}`, running: true, questions: list, index: 0, answers: {}, startAt: Date.now(), durationSeconds: 120*60, timer: null };
+  appState.exam = { id: uid('exam'), examName: `模拟考试（${examScopeLabel(scope)}） ${new Date().toLocaleString()}`, running: true, questions: list, index: 0, answers: {}, startAt: Date.now(), durationSeconds: 120*60, timer: null };
   startExamTimer();
   render();
 }
@@ -747,17 +800,21 @@ function renderExamResult(id) {
 
 function renderExam() {
   if (appState.exam?.running) return renderExamRunning();
+  const scope = appState.examBankScope || 'all';
+  const scoped = filterQuestionsByExamScope(scope);
   const pools = {
-    single: db.questions.filter((q) => q.isActive && q.questionType === 'single').length,
-    multiple: db.questions.filter((q) => q.isActive && q.questionType === 'multiple').length,
-    judge: db.questions.filter((q) => q.isActive && q.questionType === 'judge').length
+    single: scoped.filter((q) => q.questionType === 'single').length,
+    multiple: scoped.filter((q) => q.questionType === 'multiple').length,
+    judge: scoped.filter((q) => q.questionType === 'judge').length
   };
   const warns = [];
+  if (!scoped.length) warns.push(`当前“${examScopeLabel(scope)}”下没有可用题目。`);
   if (pools.single < 100) warns.push(`单选题题库不足 100 道（当前 ${pools.single}），考试时将允许重复抽题。`);
   if (pools.multiple < 30) warns.push(`多选题题库不足 30 道（当前 ${pools.multiple}），考试时将允许重复抽题。`);
   if (pools.judge < 40) warns.push(`判断题题库不足 40 道（当前 ${pools.judge}），考试时将允许重复抽题。`);
+  const total = pools.single + pools.multiple + pools.judge;
 
-  return `<div class="card"><h3>试卷结构（固定）</h3><table class="table" style="margin-top:8px;"><thead><tr><th>题型</th><th>数量</th><th>每题分值</th><th>小计</th></tr></thead><tbody><tr><td>单选题</td><td>100</td><td>0.5</td><td>50</td></tr><tr><td>多选题</td><td>30</td><td>1.0</td><td>30</td></tr><tr><td>判断题</td><td>40</td><td>0.5</td><td>20</td></tr><tr><td><strong>总计</strong></td><td><strong>170</strong></td><td>-</td><td><strong>100</strong></td></tr></tbody></table><p class="hint" style="margin-top:8px;">考试时长默认 120 分钟，可提前交卷。</p>${warns.length ? `<div class="notice" style="margin-top:10px;">${warns.map((w)=>`<div>${escapeHtml(w)}</div>`).join('')}</div>` : ''}<div class="row" style="margin-top:12px;"><button class="btn primary" data-act="start-exam">开始模拟考试</button></div></div><div class="card" style="margin-top:12px;"><h3>历史考试记录</h3>${renderExamHistoryTable()}</div>`;
+  return `<div class="card"><h3>试卷结构（固定）</h3><table class="table" style="margin-top:8px;"><thead><tr><th>题型</th><th>数量</th><th>每题分值</th><th>小计</th></tr></thead><tbody><tr><td>单选题</td><td>100</td><td>0.5</td><td>50</td></tr><tr><td>多选题</td><td>30</td><td>1.0</td><td>30</td></tr><tr><td>判断题</td><td>40</td><td>0.5</td><td>20</td></tr><tr><td><strong>总计</strong></td><td><strong>170</strong></td><td>-</td><td><strong>100</strong></td></tr></tbody></table><p class="hint" style="margin-top:8px;">考试时长默认 120 分钟，可提前交卷。</p><div class="filter" style="margin-top:10px;"><label class="hint">抽题题库</label><select id="examBankScope"><option value="original" ${scope==='original'?'selected':''}>原始题库（不含补充）</option><option value="supplement" ${scope==='supplement'?'selected':''}>补充题库</option><option value="all" ${scope==='all'?'selected':''}>全部考题</option></select><button class="btn" data-act="apply-exam-bank-scope">应用</button></div><div class="kv" style="margin-top:10px;"><div class="label">当前题库</div><div>${examScopeLabel(scope)}</div><div class="label">单选题</div><div>${pools.single}</div><div class="label">多选题</div><div>${pools.multiple}</div><div class="label">判断题</div><div>${pools.judge}</div><div class="label">总题数</div><div>${total}</div></div>${warns.length ? `<div class="notice" style="margin-top:10px;">${warns.map((w)=>`<div>${escapeHtml(w)}</div>`).join('')}</div>` : ''}<div class="row" style="margin-top:12px;"><button class="btn primary" data-act="start-exam">开始模拟考试</button></div></div><div class="card" style="margin-top:12px;"><h3>历史考试记录</h3>${renderExamHistoryTable()}</div>`;
 }
 
 function renderWrongs() {
@@ -838,7 +895,7 @@ function parseImportText(raw) {
     const [chapter, type, stem, a, b, c, d, ans, analysis] = cols;
     let correctAnswer = ans.trim();
     if (type.trim() === 'multiple') correctAnswer = ans.includes('|') ? ans.split('|').map((x) => x.trim()) : ans.split('').map((x) => x.trim()).filter(Boolean);
-    parsed.push({ id: uid('q'), chapter: chapter.trim(), questionType: type.trim(), stem: stem.trim(), options: [a, b, c, d].filter((x) => x && x.trim()), correctAnswer, analysis: analysis?.trim() || '暂无解析', difficulty: '未设置', source: '后台导入', isActive: true });
+    parsed.push({ id: uid('q'), chapter: chapter.trim(), questionType: type.trim(), stem: stem.trim(), options: [a, b, c, d].filter((x) => x && x.trim()), correctAnswer, analysis: analysis?.trim() || '暂无解析', difficulty: '未设置', source: '补充题库（本地导入）', isActive: true });
   }
   return parsed;
 }
@@ -867,7 +924,7 @@ function render() {
   if (hash === '#/dashboard') { view.innerHTML = renderDashboard(); setHeader('首页仪表盘', '查看学习进度并快速开始刷题'); }
   else if (hash === '#/chapters') { view.innerHTML = renderChapters(); setHeader('章节列表', '选择章节进入题型刷题'); }
   else if (hash === '#/practice') { view.innerHTML = renderPractice(); setHeader('刷题页', '支持立即判分、收藏、错题管理'); }
-  else if (hash === '#/exam') { view.innerHTML = renderExam(); setHeader('模拟考试', '单选100 + 多选30 + 判断40，满分100'); }
+  else if (hash === '#/exam') { view.innerHTML = renderExam(); setHeader('模拟考试', '可选原始题库/补充题库/全部考题进行组卷'); }
   else if (hash.startsWith('#/exam-result/')) { view.innerHTML = renderExamResult(hash.split('/')[2]); setHeader('考试结果', '查看总分、错题、用时与考试详情'); }
   else if (hash === '#/wrongs') { view.innerHTML = renderWrongs(); setHeader('错题本', '按章节/题型筛选并重刷未掌握错题'); }
   else if (hash === '#/favorites') { view.innerHTML = renderFavorites(); setHeader('收藏夹', '管理重点题目并快速复习'); }
@@ -899,26 +956,41 @@ function bindEvents() {
     const act = t.dataset.act;
     if (!act) return;
 
-    if (act === 'save-cloud-config') {
-      setCloudConfig({
-        enabled: !!document.getElementById('cloudEnabled')?.checked,
-        autoSync: !!document.getElementById('cloudAutoSync')?.checked,
-        serverUrl: document.getElementById('cloudServerUrl')?.value || '',
-        userId: document.getElementById('cloudUserId')?.value || '',
-        password: document.getElementById('cloudPassword')?.value || ''
+    if (act === 'refresh-local-users') {
+      refreshLocalUsers().then(() => render());
+      return;
+    }
+
+    if (act === 'save-local-user') {
+      const inputUser = document.getElementById('localUserInput')?.value || '';
+      const selectUser = document.getElementById('localUserSelect')?.value || '';
+      const target = normalizeLocalUserId(inputUser || selectUser || appState.localUserId);
+      if (!target) {
+        alert('请输入用户名称。');
+        return;
+      }
+      if (target !== appState.localUserId) {
+        switchLocalUser(target, false)
+          .then((ok) => { if (!ok) return; return saveLocalUserState(true); })
+          .then(() => render());
+      } else {
+        saveLocalUserState(true).then(() => render());
+      }
+      return;
+    }
+
+    if (act === 'switch-local-user') {
+      const inputUser = document.getElementById('localUserInput')?.value || '';
+      const selectUser = document.getElementById('localUserSelect')?.value || '';
+      const target = normalizeLocalUserId(inputUser || selectUser);
+      if (!target) {
+        alert('请选择或输入用户。');
+        return;
+      }
+      switchLocalUser(target, true).then((ok) => {
+        if (!ok) return;
+        render();
       });
-      setCloudStatus(appState.cloudConfig.enabled ? '云同步已启用，建议先执行一次“从云端拉取”。' : '未启用云同步');
-      render();
-      return;
-    }
-
-    if (act === 'cloud-pull') {
-      pullCloudState(true).then((ok) => { if (ok) render(); });
-      return;
-    }
-
-    if (act === 'cloud-push') {
-      pushCloudState(true).then(() => render());
       return;
     }
 
@@ -974,7 +1046,8 @@ function bindEvents() {
 
     if (act === 'clear-practice') { appState.practice = null; goto('#/chapters'); return; }
 
-    if (act === 'start-exam') { startExam(); return; }
+    if (act === 'apply-exam-bank-scope') { updateExamBankScopeFromUI(); render(); return; }
+    if (act === 'start-exam') { updateExamBankScopeFromUI(); startExam(appState.examBankScope); return; }
     if (act === 'exam-prev') { captureExamAnswer(); if (appState.exam.index > 0) appState.exam.index -= 1; render(); return; }
     if (act === 'exam-next') { captureExamAnswer(); if (appState.exam.index < appState.exam.questions.length - 1) appState.exam.index += 1; render(); return; }
 
@@ -1040,20 +1113,26 @@ function bindEvents() {
 
   document.body.addEventListener('change', (e) => {
     const t = e.target;
-    if (!(t instanceof HTMLInputElement)) return;
-    if (t.name === 'answer-single' || t.name === 'answer-multiple') updatePracticeAnswerByInput(t);
-    if (t.name === 'exam-single' || t.name === 'exam-multiple') captureExamAnswer();
+    if (t instanceof HTMLInputElement) {
+      if (t.name === 'answer-single' || t.name === 'answer-multiple') updatePracticeAnswerByInput(t);
+      if (t.name === 'exam-single' || t.name === 'exam-multiple') captureExamAnswer();
+      return;
+    }
+    if (t instanceof HTMLSelectElement && t.id === 'examBankScope') {
+      updateExamBankScopeFromUI();
+      render();
+    }
   });
 }
 
 async function init() {
   loadData();
   bindEvents();
-  if (appState.cloudConfig?.enabled) {
-    setCloudStatus('云同步已启用');
-    await pullCloudState(false);
-  } else {
-    setCloudStatus('未启用云同步');
+  setLocalSelectedUser(appState.localUserId || getLocalSelectedUser());
+  const localReady = await refreshLocalUsers();
+  if (localReady) {
+    const switched = await loadLocalUserState(appState.localUserId, false);
+    if (!switched) setLocalUserStatus(`当前用户：${appState.localUserId}`);
   }
   if (!location.hash) location.hash = '#/dashboard';
   render();

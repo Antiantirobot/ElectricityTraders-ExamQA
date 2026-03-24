@@ -2,6 +2,7 @@
 import json
 import mimetypes
 import os
+import re
 import sqlite3
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -10,6 +11,7 @@ from urllib.parse import urlparse
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / 'sync_progress.db'
+USER_DIR = BASE_DIR / 'User'
 HOST = os.getenv('HOST', '0.0.0.0')
 PORT = int(os.getenv('PORT', '8000'))
 
@@ -24,6 +26,7 @@ def password_hash(user_id: str, password: str) -> str:
 
 
 def init_db() -> None:
+    USER_DIR.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             '''
@@ -44,6 +47,64 @@ def init_db() -> None:
             )
             '''
         )
+
+
+def normalize_local_user_id(raw_user_id: str) -> str:
+    user_id = str(raw_user_id or '').strip()
+    if not user_id:
+        return ''
+    return user_id[:64]
+
+
+def safe_local_user_file(user_id: str) -> Path:
+    safe = re.sub(r'[\\/:*?"<>|]+', '_', user_id).strip().strip('.')
+    if not safe:
+        raise ValueError('用户标识不合法')
+    return USER_DIR / f'{safe}.json'
+
+
+def list_local_users() -> list[dict]:
+    users: list[dict] = []
+    if not USER_DIR.exists():
+        return users
+
+    for fp in USER_DIR.glob('*.json'):
+        try:
+            obj = json.loads(fp.read_text(encoding='utf-8'))
+            uid = normalize_local_user_id(obj.get('userId', ''))
+            if not uid:
+                continue
+            users.append({'userId': uid, 'updatedAt': str(obj.get('updatedAt') or '')})
+        except Exception:
+            continue
+
+    users.sort(key=lambda x: x.get('updatedAt') or '', reverse=True)
+    return users
+
+
+def load_local_user_state(user_id: str) -> tuple[bool, dict | None, str | None]:
+    fp = safe_local_user_file(user_id)
+    if not fp.exists():
+        return False, None, None
+
+    obj = json.loads(fp.read_text(encoding='utf-8'))
+    state = obj.get('state')
+    if not isinstance(state, dict):
+        state = {}
+    updated_at = str(obj.get('updatedAt') or '')
+    return True, state, updated_at
+
+
+def save_local_user_state(user_id: str, state: dict) -> str:
+    updated_at = now_iso()
+    fp = safe_local_user_file(user_id)
+    payload = {
+        'userId': user_id,
+        'updatedAt': updated_at,
+        'state': state,
+    }
+    fp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+    return updated_at
 
 
 def ensure_user(user_id: str, password: str, create_if_missing: bool) -> tuple[bool, str]:
@@ -129,14 +190,57 @@ class Handler(BaseHTTPRequestHandler):
             send_json(self, {'ok': True, 'time': now_iso(), 'db': str(DB_PATH.name)})
             return
 
-        # SPA + 静态资源
+        if p == '/api/local/users/list':
+            send_json(self, {'ok': True, 'users': list_local_users()})
+            return
+
         if p == '/' or p == '':
-            serve_file(self, 'index.html')
+            home = 'index.html' if (BASE_DIR / 'index.html').exists() else 'Start.html'
+            serve_file(self, home)
             return
         serve_file(self, p)
 
     def do_POST(self):
         p = urlparse(self.path).path
+
+        if p == '/api/local/users/load':
+            body = read_json_body(self)
+            user_id = normalize_local_user_id(body.get('userId', ''))
+            if not user_id:
+                send_json(self, {'ok': False, 'message': '用户不能为空'}, 400)
+                return
+            try:
+                has_data, state, updated_at = load_local_user_state(user_id)
+            except ValueError as err:
+                send_json(self, {'ok': False, 'message': str(err)}, 400)
+                return
+            except Exception as err:
+                send_json(self, {'ok': False, 'message': f'读取失败: {err}'}, 500)
+                return
+            send_json(self, {'ok': True, 'hasData': has_data, 'state': state, 'updatedAt': updated_at})
+            return
+
+        if p == '/api/local/users/save':
+            body = read_json_body(self)
+            user_id = normalize_local_user_id(body.get('userId', ''))
+            state = body.get('state', {})
+            if not user_id:
+                send_json(self, {'ok': False, 'message': '用户不能为空'}, 400)
+                return
+            if not isinstance(state, dict):
+                send_json(self, {'ok': False, 'message': 'state 格式错误'}, 400)
+                return
+            try:
+                updated_at = save_local_user_state(user_id, state)
+            except ValueError as err:
+                send_json(self, {'ok': False, 'message': str(err)}, 400)
+                return
+            except Exception as err:
+                send_json(self, {'ok': False, 'message': f'保存失败: {err}'}, 500)
+                return
+            send_json(self, {'ok': True, 'updatedAt': updated_at, 'message': 'saved'})
+            return
+
         if p == '/api/sync/pull':
             body = read_json_body(self)
             user_id = str(body.get('userId', '')).strip()
@@ -193,6 +297,7 @@ def main():
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f'Listening on http://{HOST}:{PORT}')
     print(f'DB: {DB_PATH}')
+    print(f'Local user dir: {USER_DIR}')
     server.serve_forever()
 
 
